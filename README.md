@@ -1,5 +1,7 @@
 # HTTP Core
 
+*This is an Anthropic fork from httpcore v1.0.9*
+
 [![Test Suite](https://github.com/encode/httpcore/workflows/Test%20Suite/badge.svg)](https://github.com/encode/httpcore/actions)
 [![Package version](https://badge.fury.io/py/httpcore.svg)](https://pypi.org/project/httpcore/)
 
