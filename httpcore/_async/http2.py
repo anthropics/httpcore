@@ -8,6 +8,7 @@ import typing
 
 import h2.config
 import h2.connection
+import h2.errors
 import h2.events
 import h2.exceptions
 import h2.settings
@@ -381,6 +382,21 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
                     ):
                         if event.stream_id in self._events:
                             self._events[event.stream_id].append(event)
+                        elif (
+                            isinstance(event, h2.events.DataReceived)
+                            and event.flow_controlled_length
+                        ):
+                            # DATA for a stream we've stopped tracking (the
+                            # response was closed while this read was in
+                            # flight). The bytes still count against the
+                            # connection's inbound flow-control window, so
+                            # hand the credit back rather than leaking it.
+                            try:
+                                self._h2_state.acknowledge_received_data(
+                                    event.flow_controlled_length, event.stream_id
+                                )
+                            except h2.exceptions.H2Error:  # pragma: nocover
+                                pass
 
                     elif isinstance(event, h2.events.ConnectionTerminated):
                         self._connection_terminated = event
@@ -408,7 +424,8 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
 
     async def _response_closed(self, stream_id: int) -> None:
         await self._max_streams_semaphore.release()
-        del self._events[stream_id]
+        pending = self._events.pop(stream_id, [])
+        self._release_stream_flow_control(stream_id, pending)
         async with self._state_lock:
             if self._connection_terminated and not self._events:
                 await self.aclose()
@@ -420,6 +437,53 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
                     self._expire_at = now + self._keepalive_expiry
                 if self._used_all_stream_ids:  # pragma: nocover
                     await self.aclose()
+
+    def _release_stream_flow_control(
+        self,
+        stream_id: int,
+        pending: typing.Sequence[h2.events.Event],
+    ) -> None:
+        """
+        Return any flow-control credit held by a stream that is being closed.
+
+        A stream can be closed before completing cleanly — the caller abandoned
+        the response body, or aborted mid-way through sending the request body.
+        Without this, two kinds of connection-window credit leak permanently,
+        and since HTTP/2 multiplexes every request over a shared connection,
+        enough aborted streams stall *all* traffic on the connection:
+
+        * DATA the server sent that was never consumed counts against our
+          inbound connection window until acknowledged — so acknowledge any
+          events still queued for the stream.
+        * The server doesn't know we abandoned the stream, and keeps buffered
+          (unread) request DATA counted against its inbound connection window,
+          which is our outbound window — so send RST_STREAM, telling it to
+          discard the stream and return the credit.
+
+        This only queues frames on the h2 state; they go out with the next
+        network write on the connection. It must not write itself: it runs on
+        the (often cancelled, shielded) close path, where a write to a stalled
+        socket would hang the cleanup. A connection that is never written to
+        again gets closed, which releases the server-side stream state anyway.
+        """
+        if self._connection_error or self._connection_terminated is not None:
+            # The connection is already dead and will not be reused — its
+            # windows die with it.
+            return
+
+        unacked = sum(
+            event.flow_controlled_length or 0
+            for event in pending
+            if isinstance(event, h2.events.DataReceived)
+        )
+        try:
+            if unacked:
+                self._h2_state.acknowledge_received_data(unacked, stream_id)
+            self._h2_state.reset_stream(stream_id, h2.errors.ErrorCodes.CANCEL)
+        except h2.exceptions.H2Error:
+            # The stream completed cleanly (or never got far enough to exist
+            # on the wire) — nothing to reset.
+            pass
 
     async def aclose(self) -> None:
         # Note that this method unilaterally closes the connection, and does
