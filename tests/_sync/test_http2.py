@@ -380,3 +380,156 @@ def test_http2_remote_max_streams_update():
                         conn._h2_state.local_settings.max_concurrent_streams,
                     )
                 i += 1
+
+
+class RecordingStream(httpcore.MockStream):
+    """Mock stream that records the bytes written to it."""
+
+    def __init__(self, buffer, http2=False):
+        super().__init__(buffer, http2=http2)
+        self.written = bytearray()
+
+    def write(self, buffer, timeout=None):
+        self.written.extend(buffer)
+
+
+def sent_frames(written):
+    """Parse the recorded client output into hyperframe frames."""
+    data = bytes(written)
+    if data.startswith(b"PRI * HTTP/2.0"):
+        data = data[24:]
+    frames = []
+    while data:
+        frame, length = hyperframe.frame.Frame.parse_frame_header(memoryview(data[:9]))
+        frame.parse_body(memoryview(data[9 : 9 + length]))
+        frames.append(frame)
+        data = data[9 + length :]
+    return frames
+
+
+
+def test_http2_aborted_request_body_sends_rst_stream():
+    """
+    Aborting a request midway through sending its body must RST_STREAM, so
+    the server discards the stream instead of keeping its buffered DATA
+    counted against the connection flow-control window forever. The
+    connection must remain usable for subsequent requests.
+    """
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = RecordingStream(
+        [
+            hyperframe.frame.SettingsFrame().serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=3,
+                data=hpack.Encoder().encode(
+                    [
+                        (b":status", b"200"),
+                        (b"content-type", b"plain/text"),
+                    ]
+                ),
+                flags=["END_HEADERS"],
+            ).serialize(),
+            hyperframe.frame.DataFrame(
+                stream_id=3, data=b"Hello, world!", flags=["END_STREAM"]
+            ).serialize(),
+        ]
+    )
+
+    def aborting_body():
+        yield b"Hello, "
+        raise RuntimeError("upload aborted")
+
+    with httpcore.HTTP2Connection(origin=origin, stream=stream) as conn:
+        with pytest.raises(RuntimeError):
+            conn.request(
+                "POST",
+                "https://example.com/",
+                headers={b"content-length": b"1000"},
+                content=aborting_body(),
+            )
+
+        # The connection is still usable for a second request.
+        response = conn.request("GET", "https://example.com/")
+        assert response.status == 200
+
+    rst_frames = [
+        frame
+        for frame in sent_frames(stream.written)
+        if isinstance(frame, hyperframe.frame.RstStreamFrame)
+    ]
+    # Exactly one: the aborted stream. The cleanly-completed second request
+    # must not be reset.
+    assert [frame.stream_id for frame in rst_frames] == [1]
+    assert rst_frames[0].error_code == 8  # CANCEL
+
+
+
+def test_http2_discarded_response_data_returns_flow_control():
+    """
+    Closing a response while DATA events are still queued for it must
+    acknowledge those bytes, returning their connection flow-control window
+    credit, and reset the abandoned stream.
+    """
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    chunk = b"x" * 16_384
+    # The response headers and the entire body arrive in a single read(), so
+    # every DATA event is already queued on the connection when the caller
+    # closes the response without consuming the body. The total is large
+    # enough that acknowledging it must emit a connection-level WINDOW_UPDATE.
+    body_frames = b"".join(
+        hyperframe.frame.DataFrame(stream_id=1, data=chunk).serialize()
+        for _ in range(531)
+    )
+    headers_frame = hyperframe.frame.HeadersFrame(
+        stream_id=1,
+        data=hpack.Encoder().encode(
+            [
+                (b":status", b"200"),
+                (b"content-type", b"plain/text"),
+            ]
+        ),
+        flags=["END_HEADERS"],
+    ).serialize()
+    stream = RecordingStream(
+        [
+            hyperframe.frame.SettingsFrame().serialize(),
+            headers_frame + body_frames,
+            hyperframe.frame.HeadersFrame(
+                stream_id=3,
+                data=hpack.Encoder().encode(
+                    [
+                        (b":status", b"200"),
+                        (b"content-type", b"plain/text"),
+                    ]
+                ),
+                flags=["END_HEADERS"],
+            ).serialize(),
+            hyperframe.frame.DataFrame(
+                stream_id=3, data=b"Hello, world!", flags=["END_STREAM"]
+            ).serialize(),
+        ]
+    )
+    with httpcore.HTTP2Connection(origin=origin, stream=stream) as conn:
+        with conn.stream("GET", "https://example.com/") as response:
+            assert response.status == 200
+            # Exit without reading the body.
+
+        # The credit-release frames are queued on close and go out with the
+        # next write on the connection — here, the next request.
+        second = conn.request("GET", "https://example.com/")
+        assert second.status == 200
+
+    frames = sent_frames(stream.written)
+    window_updates = [
+        frame.window_increment
+        for frame in frames
+        if isinstance(frame, hyperframe.frame.WindowUpdateFrame)
+        and frame.stream_id == 0
+        and frame.window_increment != 2**24  # the connection-init increment
+    ]
+    # All 531 discarded chunks are acknowledged on close.
+    assert sum(window_updates) == 531 * len(chunk)
+    assert any(
+        isinstance(frame, hyperframe.frame.RstStreamFrame) and frame.stream_id == 1
+        for frame in frames
+    )

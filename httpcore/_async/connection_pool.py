@@ -292,9 +292,7 @@ class AsyncConnectionPool(AsyncRequestInterface):
                 # log: "closing expired connection"
                 self._connections.remove(connection)
                 closing_connections.append(connection)
-            elif (
-                connection.is_idle() and n_idle > self._max_keepalive_connections
-            ):
+            elif connection.is_idle() and n_idle > self._max_keepalive_connections:
                 # log: "closing idle connection"
                 self._connections.remove(connection)
                 closing_connections.append(connection)
