@@ -18,6 +18,7 @@ from .._exceptions import (
     ConnectionNotAvailable,
     LocalProtocolError,
     RemoteProtocolError,
+    WriteError,
 )
 from .._models import Origin, Request, Response
 from .._synchronization import Lock, Semaphore, ShieldCancellation
@@ -527,25 +528,44 @@ class HTTP2Connection(ConnectionInterface):
         timeout = timeouts.get("write", None)
 
         with self._write_lock:
-            data_to_send = self._h2_state.data_to_send()
-
             if self._write_exception is not None:
-                raise self._write_exception  # pragma: nocover
+                raise self._write_exception
 
             try:
+                data_to_send = self._h2_state.data_to_send()
                 self._network_stream.write(data_to_send, timeout)
-            except Exception as exc:  # pragma: nocover
-                # If we get a network error we should:
+            except BaseException as exc:
+                # `data_to_send()` irreversibly drains frames out of the h2
+                # state: once it has returned, those frames exist nowhere but
+                # in the local variable. If the write does not complete — a
+                # network error, or a cancellation delivered at any
+                # checkpoint in this window — the drained frames are lost. They
+                # may include HEADERS (HPACK dynamic-table updates) and
+                # frames queued by concurrent streams, so the connection's
+                # HTTP/2 state is out of sync with the peer even when zero
+                # bytes reached the wire. The connection must never be used
+                # again. So we:
                 #
-                # 1. Save the exception and just raise it immediately on any future write.
-                #    (For example, this means that a single write timeout or disconnect will
-                #    immediately close all pending streams. Without requiring multiple
-                #    sequential timeouts.)
-                # 2. Mark the connection as errored, so that we don't accept any other
-                #    incoming requests.
-                self._write_exception = exc
+                # 1. Save an exception to raise immediately on any future
+                #    write. (For example, this means that a single write
+                #    timeout or disconnect will immediately fail all pending
+                #    streams, without requiring multiple sequential
+                #    timeouts.) Cancellation exceptions must not be stored:
+                #    re-raising one in another task would corrupt that
+                #    task's cancel-scope accounting — store a WriteError
+                #    describing what happened instead.
+                # 2. Mark the connection as errored, so that the pool stops
+                #    offering it to new requests.
+                if isinstance(exc, Exception):
+                    self._write_exception = exc
+                else:
+                    self._write_exception = WriteError(
+                        "Write interrupted by cancellation. The HTTP/2 "
+                        "connection state is no longer synchronized with "
+                        "the peer, so the connection cannot be reused."
+                    )
                 self._connection_error = True
-                raise exc
+                raise
 
     # Flow control...
 
