@@ -188,12 +188,16 @@ async def test_h2_timeout_during_handshake():
 @pytest.mark.anyio
 async def test_h2_timeout_during_request():
     """
-    An async timeout on an HTTP/2 during a request
-    should leave the connection in a neatly idle state.
+    An async timeout during an HTTP/2 request write must make the
+    connection unusable.
 
-    The connection is not closed because it is multiplexed,
-    and a timeout on one request does not require the entire
-    connection be closed.
+    `h2`'s `data_to_send()` drains frames out of the HTTP/2 state before
+    the network write runs; a cancellation delivered in the write window
+    discards those frames (HPACK dynamic-table updates included), leaving
+    the connection's HTTP/2 state out of sync with the peer — even when
+    zero bytes reached the wire. Reusing the connection would silently
+    lose requests, so it must no longer be offered to the pool, and
+    later writes on it must fail loudly rather than hang.
     """
     origin = httpcore.Origin(b"http", b"example.com", 80)
     stream = HandshakeThenSlowWriteStream()
@@ -201,8 +205,105 @@ async def test_h2_timeout_during_request():
         with anyio.move_on_after(0.01):
             await conn.request("GET", "http://example.com")
 
-        assert not conn.is_closed()
-        assert conn.is_idle()
+        assert not conn.is_available()
+
+        with pytest.raises(httpcore.WriteError):
+            await conn.request("GET", "http://example.com")
+
+
+@pytest.mark.anyio
+async def test_h2_cancellation_fails_concurrent_streams_fast():
+    """
+    A cancellation during one stream's write poisons the multiplexed
+    connection for every other stream on it. Requests already waiting
+    on the connection's write lock must fail promptly and loudly
+    (rather than writing into the desynchronized connection, or
+    hanging).
+    """
+    origin = httpcore.Origin(b"http", b"example.com", 80)
+    stream = HandshakeThenSlowWriteStream()
+    async with httpcore.AsyncHTTP2Connection(origin, stream) as conn:
+        other_error: typing.Optional[Exception] = None
+
+        async def other_request() -> None:
+            nonlocal other_error
+            # Give the first request time to take the h2 write lock.
+            await anyio.sleep(0.05)
+            try:
+                with anyio.fail_after(2):
+                    await conn.request("GET", "http://example.com")
+            except Exception as exc:
+                other_error = exc
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(other_request)
+            with anyio.move_on_after(0.1):
+                await conn.request("GET", "http://example.com")
+
+        assert isinstance(other_error, httpcore.WriteError)
+        assert not conn.is_available()
+
+
+class CancelledWriteThenWorkingBackend(httpcore.AsyncNetworkBackend):
+    """
+    The first connection stalls during the request write (so that the
+    request gets cancelled mid-write); subsequent connections serve a
+    valid HTTP/2 response.
+    """
+
+    def __init__(self) -> None:
+        self.connect_count = 0
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: typing.Optional[float] = None,
+        local_address: typing.Optional[str] = None,
+        socket_options: typing.Optional[typing.Iterable[httpcore.SOCKET_OPTION]] = None,
+    ) -> httpcore.AsyncNetworkStream:
+        self.connect_count += 1
+        if self.connect_count == 1:
+            return HandshakeThenSlowWriteStream()
+        return httpcore.AsyncMockStream(
+            [
+                hyperframe.frame.SettingsFrame().serialize(),
+                hyperframe.frame.HeadersFrame(
+                    stream_id=1,
+                    data=hpack.Encoder().encode(
+                        [
+                            (b":status", b"200"),
+                            (b"content-type", b"plain/text"),
+                        ]
+                    ),
+                    flags=["END_HEADERS"],
+                ).serialize(),
+                hyperframe.frame.DataFrame(
+                    stream_id=1, data=b"Hello, world!", flags=["END_STREAM"]
+                ).serialize(),
+            ]
+        )
+
+
+@pytest.mark.anyio
+async def test_h2_pool_does_not_reuse_connection_after_cancelled_write():
+    """
+    After a request on a shared HTTP/2 connection is cancelled mid-write,
+    the pool must not reuse that connection: the next request must be
+    served on a fresh connection.
+    """
+    network_backend = CancelledWriteThenWorkingBackend()
+    async with httpcore.AsyncConnectionPool(
+        http1=False, http2=True, network_backend=network_backend
+    ) as pool:
+        with anyio.move_on_after(0.01):
+            await pool.request("GET", "http://example.com")
+
+        with anyio.fail_after(2):
+            response = await pool.request("GET", "http://example.com")
+
+        assert response.status == 200
+        assert network_backend.connect_count == 2
 
 
 @pytest.mark.anyio
@@ -240,3 +341,6 @@ async def test_h2_timeout_during_response():
 
         assert not conn.is_closed()
         assert conn.is_idle()
+        # A cancellation during the response *read* loses no outgoing
+        # frames, so the multiplexed connection remains safe to reuse.
+        assert conn.is_available()
